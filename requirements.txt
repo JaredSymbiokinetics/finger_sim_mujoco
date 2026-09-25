@@ -1,0 +1,7 @@
+# python -m venv .venv && .\.venv\Scripts\Activate.ps1 && pip install -r requirements.txt
+numpy>=1.26
+scipy>=1.11
+pillow
+mujoco>=3.2
+imageio>=2.34
+imageio-ffmpeg

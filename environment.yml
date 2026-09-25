@@ -1,0 +1,24 @@
+# conda env create -f environment.yml && conda activate fingersim
+#
+# Deliberately minimal. In particular there is NO conda ffmpeg: it pulls in the whole
+# cairo / pango / librsvg / gdk-pixbuf graphics stack, none of which this project uses,
+# and gdk-pixbuf's post-link script fails on any prefix containing a space (a Windows
+# username like "Jared Grinberg" is enough). The pip package imageio-ffmpeg ships its own
+# ffmpeg binary, which is all the video writer needs.
+name: fingersim
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - numpy>=1.26
+  - scipy>=1.11          # LP for contact-force allocation and finger minimisation
+  - pillow               # HUD overlay
+  - pip
+  - pip:
+      - mujoco>=3.2
+      - imageio>=2.34
+      - imageio-ffmpeg   # bundles ffmpeg; no system ffmpeg required
+# Headless Linux additionally needs OSMesa, a system package:
+#   sudo apt-get install libosmesa6 libosmesa6-dev && export MUJOCO_GL=osmesa
+# On Windows or any machine with a GPU/display, leave MUJOCO_GL unset.
