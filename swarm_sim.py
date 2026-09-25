@@ -56,7 +56,7 @@ from scipy.spatial.transform import Slerp  # noqa: E402
 CUBE_HALF = 0.030          # m, half-edge of the object (60 mm cube)
 CUBE_MASS = 0.150          # kg
 TIP_RADIUS = 0.009         # m, spherical fingertip radius
-SHAFT_LEN = 0.055          # m, visual-only finger shaft
+SHAFT_LEN = 0.032          # m, finger shaft (collides)
 MU_TIP = 1.20              # fingertip/object Coulomb friction (compliant gel)
 MU_TABLE = 0.45            # object/table Coulomb friction
 TIMESTEP = 0.001           # s
@@ -191,8 +191,11 @@ KD_POS = 0.012             # s, velocity-error damping on the commanded pose
 KD_ROT = 0.004             # s, same for angular velocity error
 KI_POS = 3.0               # 1/s, integral gain on position error
 KI_ROT = 2.0               # 1/s, integral gain on orientation error
-IMAX_POS = 0.010           # m, anti-windup clamp
-IMAX_ROT = 0.15            # rad, anti-windup clamp
+# The integral clamp must keep KI_POS * IMAX_POS strictly below the grip penetration,
+# or the integrator can walk a finger clean off the object it is holding. At 3.0 * 0.0005
+# the most it can ever command is 1.5 mm against a 3.0 mm squeeze.
+IMAX_POS = 0.0005          # m, anti-windup clamp
+IMAX_ROT = 0.05            # rad, anti-windup clamp
 SLEW = 1.60                # m/s, rate limit on fingertip setpoint motion
 
 BASE_COLORS = [
@@ -486,9 +489,95 @@ def build_corner_reference():
     return Reference(k), seg
 
 
+HANDOFF_PLACERS = 6        # equator fingers that lift and place; --fingers sets this
+
+
+def make_handoff_contacts(n_place=None):
+    """Six equator contacts that can lift and place, plus one on the top vertex.
+
+    The vertex contact is the whole point. Both vertices lie on the body diagonal, so
+    once the cube is standing on its bottom vertex, pressing down on the top one pins it
+    between two points: any tilt has to drag the top vertex sideways against the
+    fingertip's friction. Lever arm is the full body diagonal, oriented vertically, which
+    is exactly the geometry that resists the two tipping axes.
+    """
+    a = CUBE_HALF
+    diag = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)
+    n_place = HANDOFF_PLACERS if n_place is None else n_place
+    return make_contacts(n_place) + [(np.array([a, a, a]), diag)]
+
+
+# The handoff timeline. Kept here so the trajectory and the grasp schedule cannot drift
+# apart: the vertex finger must be loaded BEFORE the equator fingers let go.
+HO_SETTLED = 11.1          # cube standing on its vertex, still held by all six
+HO_VERTEX_ON = (10.6, 11.6)
+HO_EQUATOR_OFF = (11.9, 12.9)
+HO_HOLD_END = 19.1
+HO_VERTEX_OFF = (HO_HOLD_END, HO_HOLD_END + 0.7)
+
+
+def build_handoff_reference():
+    """Swarm places the cube on its vertex, then hands off to a single finger."""
+    k, seg = [], []
+    t = 0.0
+
+    def hold(dur, pos, quat, label=None):
+        nonlocal t
+        k.append((t, pos, quat))
+        if label:
+            seg.append((t, t + dur, label))
+        t += dur
+        k.append((t, pos, quat))
+
+    def move(dur, pos, quat, label):
+        nonlocal t
+        seg.append((t, t + dur, label))
+        t += dur
+        k.append((t, pos, quat))
+
+    hold(3.0, [0, 0, REST_Z], IDENT, "approach + grasp")
+    move(1.6, [0, 0, REST_Z + 0.09], IDENT, "lift clear")
+    move(3.0, [0, 0, CORNER_Z + 0.055], CORNER_QUAT, "rotate onto the diagonal")
+    move(2.0, [0, 0, CORNER_Z], CORNER_QUAT, "lower onto the vertex")
+    move(1.5, [0, 0, CORNER_Z], CORNER_QUAT, "settle")
+    move(2.0, [0, 0, CORNER_Z], CORNER_QUAT, "HANDOFF - six let go")
+    move(6.0, [0, 0, CORNER_Z], CORNER_QUAT, "ONE FINGER HOLDING")
+    move(2.5, [0, 0, CORNER_Z], CORNER_QUAT, "release - it topples")
+    return Reference(k), seg
+
+
+def setup_handoff(n_place=None):
+    """Contacts, per-finger schedule and the nudges that prove the hold is active.
+
+    `n_place` is the size of the placement swarm. The vertex finger is always added on
+    top of it, so --fingers 4 means five bodies in the scene: four that lift and place,
+    one that takes over at the end.
+    """
+    global FINGER_SCHEDULE, DISTURBANCES, HANDOFF_PLACERS
+    if n_place is not None:
+        HANDOFF_PLACERS = n_place
+    n = HANDOFF_PLACERS
+    set_finger_count(0, contacts=make_handoff_contacts(n))
+    FINGER_SCHEDULE = (
+        [(GRASP_START, GRASP_END, *HO_EQUATOR_OFF) for _ in range(n)]
+        + [(HO_VERTEX_ON[0], HO_VERTEX_ON[1], *HO_VERTEX_OFF)]
+    )
+    # Tipping torques about horizontal axes, while only the vertex finger is on.
+    # 0.15 N m is an order of magnitude above the 18.5 mN m that gravity itself applies
+    # at a 14 degree tilt, and sits just under the ~0.21 N m single-axis threshold where
+    # the vertex contact breaks. The tilt response is tiny because the two-point pin is
+    # stiff; watch the grip-force bar rather than the cube.
+    DISTURBANCES = [
+        (14.2, 14.35, [0, 0, 0, 0.15, 0, 0]),
+        (15.8, 15.95, [0, 0, 0, 0, -0.15, 0]),
+        (17.4, 17.55, [0, 0, 0, 0.106, 0.106, 0]),
+    ]
+
+
 TASKS = {
     "demo": (build_reference, "equator"),
     "corner": (build_corner_reference, "corner"),
+    "handoff": (build_handoff_reference, "equator"),
 }
 TASK = "demo"
 LAYOUT = "equator"
@@ -499,17 +588,23 @@ LAYOUT = "equator"
 # friction, so the object never starts turning and the clamp never releases. The corner
 # task rotates 54.7 degrees onto the body diagonal, which the demo's 28.6 degree clamp
 # cannot accommodate.
-TASK_LAG_ROT = {"demo": 0.50, "corner": 1.20}
+TASK_LAG_ROT = {"demo": 0.50, "corner": 1.20, "handoff": 1.20}
 
 
 def set_task(name):
     global TASK, LAYOUT, MAX_LAG_ROT
     if name not in TASKS:
         raise SystemExit(f"unknown task {name!r}; choose from {sorted(TASKS)}")
+    global FINGER_SCHEDULE, DISTURBANCES
     TASK = name
     LAYOUT = TASKS[name][1]
     MAX_LAG_ROT = TASK_LAG_ROT[name]
-    set_finger_count(N_FINGERS)
+    FINGER_SCHEDULE = None
+    DISTURBANCES = []
+    if name == "handoff":
+        setup_handoff()
+    else:
+        set_finger_count(N_FINGERS)
 
 
 # --- hybrid position/force control -----------------------------------------------------
@@ -540,6 +635,15 @@ def cone_basis(normal, mu, n_edge=ALLOC_EDGES):
                      for j in range(n_edge)])
 
 
+# Per-finger engage/release schedule, for tasks where the grasp changes mid-run.
+# Each entry is (engage_start, engage_end, release_start, release_end) in seconds.
+# None means every finger follows the single global grasp schedule below.
+FINGER_SCHEDULE = None
+
+# Disturbances applied to the object, as (t_start, t_end, wrench6) in world frame. Used
+# to show that a balance is actively held rather than merely undisturbed.
+DISTURBANCES = []
+
 GRASP_START, GRASP_END = 0.6, 2.8      # s, fingers fly in and close
 RELEASE_START = None                   # filled in from the reference duration
 
@@ -560,6 +664,23 @@ def squeeze_depth(t: float, t_end: float) -> float:
     if t > t_end - 0.9:
         return grip + (approach_gap - grip) * smoothstep((t - (t_end - 0.9)) / 0.9)
     return grip
+
+
+def squeeze_depth_i(t: float, t_end: float, i: int) -> float:
+    """Per-finger penetration, honouring FINGER_SCHEDULE when one is set."""
+    if FINGER_SCHEDULE is None:
+        return squeeze_depth(t, t_end)
+    es, ee, rs, re_ = FINGER_SCHEDULE[i]
+    gap, grip = -0.035, 0.0030
+    if t < es:
+        return gap
+    if t < ee:
+        return gap + (grip - gap) * smoothstep((t - es) / (ee - es))
+    if t < rs:
+        return grip
+    if t < re_:
+        return grip + (gap - grip) * smoothstep((t - rs) / (re_ - rs))
+    return gap
 
 
 def finger_quat(normal_world: np.ndarray) -> np.ndarray:
@@ -609,6 +730,7 @@ class Sim:
             for i in range(N_FINGERS)
         ]
         self.cube_gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
+        self.table_gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table")
         self.reset()
 
     def reset(self):
@@ -660,6 +782,13 @@ class Sim:
 
     # -- control -------------------------------------------------------------------
 
+    def touching_table(self):
+        for ci in range(self.data.ncon):
+            c = self.data.contact[ci]
+            if self.cube_gid in (c.geom1, c.geom2) and self.table_gid in (c.geom1, c.geom2):
+                return True
+        return False
+
     def ref_twist(self, t, h=2e-3):
         """Finite-difference the reference for feedforward velocity."""
         p1, R1 = self.ref(min(t + h, self.ref.duration))
@@ -679,7 +808,12 @@ class Sim:
         v, w = self.object_twist()
         v_d, w_d = self.ref_twist(t)
 
-        self._int_p = np.clip(self._int_p + e_p * TIMESTEP, -IMAX_POS, IMAX_POS)
+        # Conditional integration. When the object is resting on the table, the table is
+        # what sets its height, and no amount of pushing will raise it to the reference.
+        # Integrating against that is a standing wind-up source: it walks the fingers
+        # upward until they let go of the object entirely.
+        if not self.touching_table():
+            self._int_p = np.clip(self._int_p + e_p * TIMESTEP, -IMAX_POS, IMAX_POS)
         self._int_r = np.clip(self._int_r + e_r * TIMESTEP, -IMAX_ROT, IMAX_ROT)
 
         lin = np.clip(e_p + KI_POS * self._int_p - KD_POS * (v - v_d),
@@ -778,18 +912,34 @@ class Sim:
             return np.array(targets), quats
 
         targets, quats = [], []
-        for offset, normal in CONTACTS:
+        for i, (offset, normal) in enumerate(CONTACTS):
+            d_i = squeeze_depth_i(t, self.ref.duration, i)
             n_w = R_c.apply(normal)
-            targets.append(p_c + R_c.apply(offset) + n_w * (TIP_RADIUS - delta))
+            targets.append(p_c + R_c.apply(offset) + n_w * (TIP_RADIUS - d_i))
             quats.append(finger_quat(n_w))
         return np.array(targets), quats
 
     def fly_in(self, t, targets):
         """Blend from the scattered home poses to the grasp poses over the approach."""
-        if t >= GRASP_START:
+        if t < GRASP_START:
+            s = smoothstep(t / GRASP_START)
+            targets = HOME + s * (targets - HOME)
+        return self.fly_out(t, targets)
+
+    def fly_out(self, t, targets):
+        """Send a released finger back to its home pose so it is clear of the object.
+
+        Without this a finger that has let go still hovers 35 mm off the surface, which
+        is close enough for a toppling object to land on it.
+        """
+        if FINGER_SCHEDULE is None:
             return targets
-        s = smoothstep(t / GRASP_START)
-        return HOME + s * (targets - HOME)
+        out = np.array(targets, dtype=float)
+        for i, (_, _, _, rel_end) in enumerate(FINGER_SCHEDULE):
+            if t > rel_end:
+                s = smoothstep((t - rel_end) / 1.2)
+                out[i] = out[i] + s * (HOME[i] - out[i])
+        return out
 
     def apply_mount_wrenches(self, targets, quats):
         """The virtual 6-DOF spring-damper holding each finger at its setpoint."""
@@ -843,6 +993,9 @@ class Sim:
             mujoco.mj_forward(self.model, self.data)
         else:
             self.apply_mount_wrenches(targets, quats)
+            for t0, t1, w in DISTURBANCES:
+                if t0 <= t < t1:
+                    self.data.xfrc_applied[self.cube_bid] += np.asarray(w, float)
             mujoco.mj_step(self.model, self.data)
 
     # -- diagnostics ---------------------------------------------------------------
@@ -887,7 +1040,7 @@ def draw_hud(frame, t, e_pos_mm, e_rot_deg, label, grip_n, mode):
     f_big, f_mid, f_small = font(int(H * 0.030)), font(int(H * 0.024)), font(int(H * 0.019))
     pad = int(H * 0.028)
 
-    d.rounded_rectangle([pad, pad, pad + int(W * 0.33), pad + int(H * 0.215)],
+    d.rounded_rectangle([pad, pad, pad + int(W * 0.33), pad + int(H * 0.250)],
                         radius=10, fill=(12, 14, 18, 205))
     x, y = pad + int(W * 0.016), pad + int(H * 0.020)
     d.text((x, y), "FINGERTIP SWARM", font=f_big, fill=(235, 238, 245, 255))
@@ -902,6 +1055,10 @@ def draw_hud(frame, t, e_pos_mm, e_rot_deg, label, grip_n, mode):
     y += int(H * 0.034)
     col = (120, 220, 150, 255) if e_rot_deg < 3 else (245, 190, 90, 255)
     d.text((x, y), f"rot err  {e_rot_deg:5.2f} deg", font=f_mid, fill=col)
+    n_touch = int((np.asarray(grip_n) > 0.05).sum())
+    y += int(H * 0.034)
+    col = (245, 190, 90, 255) if n_touch <= 1 else (200, 206, 218, 255)
+    d.text((x, y), f"contacts {n_touch:2d} / {len(grip_n)}", font=f_mid, fill=col)
 
     # Segment label, bottom centre.
     tw = d.textlength(label, font=f_mid)
@@ -1186,43 +1343,72 @@ def selftest():
 # --------------------------------------------------------------------------------------
 
 def sweep():
-    """Tracking error versus swarm size, at fixed contact-placement heuristic.
+    """Tracking versus swarm size, at the fixed contact-placement heuristic.
 
     This is NOT the minimisation you eventually want. It runs the same trajectory for
     each n and reports what the tracking looks like, so you can see where the placement
     heuristic stops producing a workable grasp. A real answer needs an optimiser over
     contact positions and a wrench-feasibility test, not a sweep over a fixed layout.
     """
-    print("\n=== tracking versus swarm size (fixed placement heuristic) ===")
-    print("  n   RMS pos    max pos    RMS rot    max rot   outcome")
-    print("  " + "-" * 62)
+    handoff = (TASK == "handoff")
+    if handoff:
+        sizes = [3, 4, 5, 6, 8, 10]
+        print("\n=== handoff: placement swarm size (+1 vertex finger) ===")
+        print("  place  total   place RMS   place max   hold max tilt   outcome")
+        print("  " + "-" * 66)
+    else:
+        sizes = [3, 6, 9, 12] if LAYOUT == "corner" else [3, 4, 5, 6, 8, 10]
+        print("\n=== tracking versus swarm size (fixed placement heuristic) ===")
+        print("  n   RMS pos    max pos    RMS rot    max rot   outcome")
+        print("  " + "-" * 62)
+
+    diag = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)
     results = []
-    sizes = [3, 6, 9, 12] if LAYOUT == "corner" else [3, 4, 5, 6, 8, 10]
     for n in sizes:
-        set_finger_count(n)
+        if handoff:
+            setup_handoff(n)
+        else:
+            set_finger_count(n)
         sim = Sim("dynamic")
-        errs = []
-        dropped = False
+        errs, hold_tilt, diverged = [], [], False
         while sim.data.time < sim.ref.duration:
             sim.step()
             t = sim.data.time
-            e_p, e_r = sim.pose_error(t)
-            if t > GRASP_END:
-                errs.append((np.linalg.norm(e_p) * 1000,
-                             np.rad2deg(np.linalg.norm(e_r))))
+            lbl = seg_label(sim.segments, t)
             if not np.all(np.isfinite(sim.data.qpos)):
-                dropped = True
+                diverged = True
                 break
+            # The release phase is a deliberate topple, not a tracking failure.
+            if "topple" in lbl or lbl in ("approach + grasp", "done"):
+                continue
+            e_p, e_r = sim.pose_error(t)
+            errs.append((np.linalg.norm(e_p) * 1000, np.rad2deg(np.linalg.norm(e_r))))
+            if lbl == "ONE FINGER HOLDING":
+                _, R = sim.object_pose()
+                hold_tilt.append(
+                    np.rad2deg(np.arccos(np.clip(R.apply(diag)[2], -1.0, 1.0))))
+
         v = np.array(errs) if errs else np.zeros((1, 2))
-        lost = dropped or v[:, 0].max() > 25.0
-        print(f"  {n:2d}  {np.sqrt((v[:,0]**2).mean()):7.2f}mm {v[:,0].max():8.2f}mm"
-              f" {np.sqrt((v[:,1]**2).mean()):8.2f}d {v[:,1].max():8.2f}d   "
-              f"{'LOST THE OBJECT' if lost else 'held'}")
+        lost = diverged or v[:, 0].max() > 25.0
+        if handoff:
+            ht = max(hold_tilt) if hold_tilt else float("nan")
+            lost = lost or not (ht < 3.0)
+            print(f"  {n:5d}  {n+1:5d}   {np.sqrt((v[:,0]**2).mean()):8.2f}mm "
+                  f"{v[:,0].max():9.2f}mm   {ht:10.2f}deg   "
+                  f"{'LOST IT' if lost else 'held'}")
+        else:
+            print(f"  {n:2d}  {np.sqrt((v[:,0]**2).mean()):7.2f}mm {v[:,0].max():8.2f}mm"
+                  f" {np.sqrt((v[:,1]**2).mean()):8.2f}d {v[:,1].max():8.2f}d   "
+                  f"{'LOST THE OBJECT' if lost else 'held'}")
         results.append((n, lost))
-    set_finger_count(6)
+
+    if handoff:
+        setup_handoff(6)
+    else:
+        set_finger_count(6)
     held = [n for n, lost in results if not lost]
-    print(f"\n  smallest swarm that held the object with this layout: n = {min(held)}"
-          if held else "\n  no swarm size held the object.")
+    print(f"\n  smallest swarm that worked with this layout: n = {min(held)}"
+          if held else "\n  no swarm size worked.")
     print("  Caveat: that is the smallest n the HEURISTIC happens to work at, not the\n"
           "  minimum number of fingers the task requires.")
     return bool(held)
@@ -1232,8 +1418,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["dynamic", "kinematic"], default="dynamic")
     ap.add_argument("--fingers", type=int, default=6,
-                    help="swarm size (3-12). Contacts are spread around the cube's "
-                         "equator; this does NOT optimise placement or minimise count.")
+                    help="swarm size (3-12), spread around the cube's equator. For "
+                         "--task handoff this is the PLACEMENT swarm; the vertex finger "
+                         "is always added on top. Does NOT optimise placement.")
     ap.add_argument("--sweep", action="store_true",
                     help="run the finger-count sweep instead of rendering")
     ap.add_argument("--task", choices=sorted(TASKS), default="demo",
@@ -1255,13 +1442,17 @@ def main():
     if args.selftest:
         sys.exit(0 if selftest() else 1)
 
+    if args.task == "handoff":
+        globals()["HANDOFF_PLACERS"] = args.fingers
     set_task(args.task)
     globals()["CONTROL"] = args.control
 
     if args.sweep:
         sys.exit(0 if sweep() else 1)
 
-    if args.contacts:
+    if args.task == "handoff":
+        pass            # setup_handoff already ran, sized by --fingers
+    elif args.contacts:
         import json
         with open(args.contacts) as fh:
             spec = json.load(fh)

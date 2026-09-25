@@ -213,44 +213,120 @@ tracking. The equator layout has genuinely opposing pairs, so the squeeze balanc
 internally and friction only has to carry the 1.47 N weight rather than hold the grasp
 together. Degradation only begins at mu = 0.25, below any plausible gel pad.
 
-### The corner balance: one finger, and the minimiser cannot find it
+### Corner balance by handoff: six fingers place it, one holds it
 
-A single fingertip pressed onto the vertex OPPOSITE the support vertex holds the balance.
-Cube starting balanced, tipping torques applied about horizontal axes:
+`--task handoff` is the working corner demo. Six equator contacts (the layout proven on
+the main demo) lift the cube, rotate it 54.7° onto its body diagonal and set it down on a
+vertex. A seventh fingertip then descends onto the OPPOSITE vertex, takes the load, and
+the six let go and fly clear.
 
-| tipping torque | no finger | one finger on top vertex |
+| segment | RMS pos | max pos | RMS rot | max rot |
+|---|---|---|---|---|
+| lift clear | 0.44 mm | 0.57 mm | 0.23° | 0.39° |
+| rotate onto the diagonal | 0.21 mm | 0.37 mm | 1.06° | 1.32° |
+| lower onto the vertex | 0.17 mm | 0.26 mm | 0.33° | 0.64° |
+| settle | 0.10 mm | 0.13 mm | 0.78° | 0.97° |
+| HANDOFF, six let go | 0.45 mm | 0.67 mm | 0.79° | 1.10° |
+| ONE FINGER HOLDING | 0.72 mm | 1.01 mm | 0.65° | 0.76° |
+
+Contact count goes 6 → 7 → 1 across the handoff and the tilt never exceeds 0.03°. The
+single vertex contact carries a steady 3.25 N. The clip ends with a deliberate release,
+and the cube topples immediately, which is the evidence the equilibrium was unstable and
+being actively held rather than merely resting.
+
+**Why the vertex.** Both vertices lie on the body diagonal, so pressing down on the top
+one pins the cube between two points and any tilt must drag the top vertex sideways
+against the fingertip's friction. Lever arm is the full 104 mm diagonal, oriented
+vertically, which is precisely the geometry that resists the two tipping axes. A
+face-centre contact gets 73 mm pointing the wrong way.
+
+**Disturbance rejection.** Single-axis tipping torque applied while only the vertex finger
+is on:
+
+| tipping torque | result |
+|---|---|
+| 0.05 to 0.21 N·m | held, peak tilt 0.14° to 0.52° |
+| 0.25 N·m | contact breaks, object lost |
+
+For scale, gravity itself applies 18.5 mN·m at a 14° tilt, so the margin is roughly 11x.
+The tilt response is tiny because the two-point pin is stiff: the system holds nearly
+rigidly right up to the point the contact breaks, with no visible wobble in between.
+Watch the grip-force bar rather than the cube.
+
+### Choosing the handoff swarm size
+
+`--fingers N` sets the PLACEMENT swarm for `--task handoff`. The vertex finger is always
+added on top, so `--fingers 4` puts five bodies in the scene. `--task handoff --sweep`
+runs the range.
+
+| placers | total | placement RMS | hold max tilt | outcome |
+|---|---|---|---|---|
+| 3 | 4 | diverges | 176.6° | lost |
+| 4 | 5 | diverges | 153.2° | lost |
+| 5 | 6 | 0.40 mm | 0.38° | **held** |
+| 6 | 7 | 0.50 mm | 0.38° | **held** |
+| 8 | 9 | 42.97 mm | 178.3° | lost |
+| 10 | 11 | diverges | 153.4° | lost |
+
+Two things worth knowing before reading much into this.
+
+**Both failure modes happen after placement, not during it.** With 4 placers the cube is
+placed fine and the handoff itself fails at t = 12.3. With 8 it survives the handoff and
+fails at t = 17.5, which is the third and largest disturbance. So the swarm size is not
+limiting the placement.
+
+**What correlates with success is the pose accuracy at the instant of transfer**, not the
+finger count:
+
+| placers | tilt when the placers let go | outcome |
 |---|---|---|
-| 5 mN·m | topples (56° peak, settles flat) | **0.00° tilt**, min grip 0.37 N |
-| 10 mN·m | topples | **0.00° tilt** |
-| 20 mN·m | topples | **0.00° tilt** |
+| 3 | 0.412° | lost |
+| 5 | 0.040° | held |
+| 6 | 0.020° | held |
+| 8 | 1.121° | lost |
 
-The no-finger column confirms the equilibrium really is unstable and the disturbance
-really does tip it. Both vertices lie on the body diagonal, so pressing down at the top
-pins the cube between two points and any tilt has to drag the top vertex sideways against
-the fingertip's friction. The lever arm is the full 104 mm diagonal, oriented purely
-vertically, so a lateral force there produces torque purely about the axes that tip it. A
-face-centre contact gets 73 mm, pointing the wrong way.
+Four data points, so treat it as a direction to investigate rather than an established
+result. If it holds up, the lever for making the handoff robust is tightening the pose at
+transfer (settle longer, or close the loop on tilt before releasing), not adding fingers.
+That would also explain why 8 and 10 placers are worse than 6, which otherwise looks
+backwards.
 
-`min_fingers.py` returned three contacts for this, and it was wrong twice over:
+### What this cost, and what it says about the minimiser
 
-1. **The candidate set excluded the answer.** It gridded face planes only. Vertices and
-   edges were not candidates at all, so "3" was the minimum over the wrong set. Fixed:
+`min_fingers.py` returned three contacts for the corner and it was wrong twice over:
+
+1. **The candidate set excluded the answer.** It gridded face planes only; vertices and
+   edges were not candidates, so "3" was the minimum over the wrong set. Fixed —
    `candidate_contacts` now includes vertices and edge midpoints.
 2. **The criterion is still wrong**, and fixing the candidates did not rescue it. With the
-   table credited in the disturbance conditions the bar is far too low (it returned two
-   face contacts, and the simulator jammed the cube against the table at a 14° lean).
-   With the table excluded the bar is too high (it demands the fingers resist a pull
-   upward, which nothing applies, and returns 3 to 4).
+   table credited in the disturbance conditions the bar is far too low. With the table
+   excluded it is too high: it demands the fingers resist a pull upward, which nothing
+   applies, and returns 3 to 4.
 
-The isotropic wrench ball is simply the wrong disturbance model for an object resting on
-a support point. The right criterion is rejection of tipping torque about the support
-point, with the disturbance set drawn from the task's physics. That is a modelling
-judgement, not an LP parameter. **For balance tasks, trust the simulator over the
-minimiser.** The tool remains sound for grasps in free space where the disturbance is
-roughly isotropic.
+An isotropic ball of wrench disturbances at the centre of mass is the wrong disturbance
+model for an object resting on a support point. The right criterion is rejection of
+tipping torque about the support point, with the disturbance set drawn from the task's
+physics. That is a modelling judgement, not an LP parameter. **For balance tasks, trust
+the simulator over the minimiser.** The tool remains sound for grasps in free space where
+the disturbance really is roughly isotropic.
 
-The old three-finger corner clip (`out/corner_balance.mp4`) is the broken version. Do not
-show it.
+`out/corner_balance.mp4` is the earlier broken three-finger attempt. Do not show it;
+`out/handoff_corner.mp4` supersedes it.
+
+### Two control fixes the handoff forced
+
+**Integrator windup walks a finger off the object.** The cube rests on the table slightly
+below the commanded height, so the vertical error never clears, the integrator winds up,
+and the commanded pose rises until the fingertip loses contact. The vertex finger's grip
+bled from 3.3 N to zero over three seconds and the cube fell. Two changes: `KI_POS *
+IMAX_POS` is now bounded well below the grip penetration (1.5 mm against a 3.0 mm
+squeeze), so the integrator can never command a finger clear of the object; and
+integration is frozen while the object is touching the table, because the table is what
+sets the height and no amount of pushing will raise it to the reference.
+
+**Released fingers must fly clear.** A finger that has let go still hovers 35 mm off the
+surface, which is close enough for a toppling object to land on. Released fingers now
+blend back to their home poses.
 
 ## Four things that bit, and will bite again
 

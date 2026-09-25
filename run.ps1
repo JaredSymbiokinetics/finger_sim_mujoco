@@ -16,3 +16,6 @@ Write-Host "--- minimise for the whole corner task, then render it ---" -Foregro
 python min_fingers.py --task corner --samples 8 --per-face 4 --out contacts_corner_full.json
 python swarm_sim.py --task corner --control hybrid `
     --contacts contacts_corner_full.json --out out/corner_balance.mp4
+
+Write-Host "--- corner balance by handoff: six place it, one holds it ---" -ForegroundColor Cyan
+python swarm_sim.py --task handoff --out out/handoff_corner.mp4

@@ -16,3 +16,6 @@ echo "--- minimise fingers for the whole corner task, then render it ---"
 python3 min_fingers.py --task corner --samples 8 --per-face 4 --out contacts_corner_full.json
 python3 swarm_sim.py --task corner --control hybrid \
     --contacts contacts_corner_full.json --out out/corner_balance.mp4
+
+echo "--- corner balance by handoff: six place it, one holds it ---"
+python3 swarm_sim.py --task handoff --out out/handoff_corner.mp4
