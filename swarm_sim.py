@@ -96,6 +96,34 @@ def make_contacts(n):
     return out
 
 
+def surface_point(direction):
+    """Ray-cast from the cube centre along `direction`; return (offset, outward normal).
+
+    This is the parameterisation the placement optimiser searches over, and the choice
+    matters. Mapping a free 3-vector onto the surface this way is continuous, covers the
+    whole boundary, and crucially includes EDGES AND VERTICES, where the normal becomes
+    the bisector of the adjoining faces. A face-grid parameterisation cannot express a
+    vertex contact, which is exactly the contact that turned out to matter for balancing
+    the cube on its corner.
+    """
+    d = np.asarray(direction, float)
+    n = np.linalg.norm(d)
+    if n < 1e-9:
+        d = np.array([1.0, 0.0, 0.0])
+    else:
+        d = d / n
+    a = CUBE_HALF
+    t = a / max(abs(d[0]), abs(d[1]), abs(d[2]))
+    p = t * d
+    nrm = np.zeros(3)
+    for i in range(3):
+        if abs(abs(p[i]) - a) < 1e-6:          # this axis is on the boundary
+            nrm[i] = np.sign(p[i])
+    if np.linalg.norm(nrm) < 1e-9:
+        nrm[int(np.argmax(np.abs(p)))] = np.sign(p[int(np.argmax(np.abs(p)))])
+    return p, nrm / np.linalg.norm(nrm)
+
+
 def make_home(contacts):
     """Start poses in free space, each one out along its own contact normal.
 
@@ -334,9 +362,11 @@ class Reference:
         s = smoothstep((t - t0) / (t1 - t0)) if t1 > t0 else 0.0
         pos = self.p[i] + s * (self.p[i + 1] - self.p[i])
         # Re-time the slerp through the same smoothstep so translation and rotation
-        # stay synchronised and both start and stop with zero rate.
-        rot = self.slerp(t0 + s * (t1 - t0))
-        return pos, rot
+        # stay synchronised and both start and stop with zero rate. Clamp the result:
+        # t0 + s*(t1-t0) is not exactly t1 in floating point, and Slerp raises on an
+        # argument a single ulp past its last knot.
+        ts = float(np.clip(t0 + s * (t1 - t0), self.t[0], self.t[-1]))
+        return pos, self.slerp(ts)
 
 
 def q(axis, deg):
@@ -574,10 +604,43 @@ def setup_handoff(n_place=None):
     ]
 
 
+def build_probe_reference():
+    """Short fitness episode: grasp, lift, hold, rotate, hold. About 5 seconds.
+
+    Picked to exercise the things a placement has to be good at (carrying weight against
+    friction, and generating torque) without paying for a full 28 second trajectory on
+    every candidate in a population.
+    """
+    k, seg = [], []
+    t = 0.0
+
+    def hold(dur, pos, quat, label=None):
+        nonlocal t
+        k.append((t, pos, quat))
+        if label:
+            seg.append((t, t + dur, label))
+        t += dur
+        k.append((t, pos, quat))
+
+    def move(dur, pos, quat, label):
+        nonlocal t
+        seg.append((t, t + dur, label))
+        t += dur
+        k.append((t, pos, quat))
+
+    hold(1.3, [0, 0, REST_Z], IDENT, "approach + grasp")
+    move(1.2, [0, 0, REST_Z + 0.12], IDENT, "lift")
+    move(0.4, [0, 0, REST_Z + 0.12], IDENT, "hold")
+    move(1.4, [0.05, 0, REST_Z + 0.12], q([1, 0, 0], 50), "rotate + translate")
+    move(0.6, [0.05, 0, REST_Z + 0.12], q([1, 0, 0], 50), "hold")
+    return Reference(k), seg
+
+
 TASKS = {
     "demo": (build_reference, "equator"),
     "corner": (build_corner_reference, "corner"),
     "handoff": (build_handoff_reference, "equator"),
+    "probe": (build_probe_reference, "equator"),
 }
 TASK = "demo"
 LAYOUT = "equator"
@@ -588,17 +651,32 @@ LAYOUT = "equator"
 # friction, so the object never starts turning and the clamp never releases. The corner
 # task rotates 54.7 degrees onto the body diagonal, which the demo's 28.6 degree clamp
 # cannot accommodate.
-TASK_LAG_ROT = {"demo": 0.50, "corner": 1.20, "handoff": 1.20}
+TASK_LAG_ROT = {"demo": 0.50, "corner": 1.20, "handoff": 1.20, "probe": 0.60}
+
+# Grasp timings per task. The probe is deliberately short: it exists to score a contact
+# placement inside an optimiser loop, where rollout cost is the binding constraint.
+TASK_GRASP = {"demo": (0.6, 2.8), "corner": (0.6, 2.8),
+              "handoff": (0.6, 2.8), "probe": (0.30, 1.10)}
+
+# How long before the end of a task the fingers let go. Zero means never. The probe must
+# never release: it is 4.9 s long, so the default 0.9 s window would fire the release
+# mid-rotation and every candidate placement would be scored as having dropped the
+# object, identically, making the whole fitness function blind.
+TASK_RELEASE = {"demo": 0.9, "corner": 0.9, "handoff": 0.0, "probe": 0.0}
+RELEASE_WINDOW = 0.9
+
 
 
 def set_task(name):
     global TASK, LAYOUT, MAX_LAG_ROT
     if name not in TASKS:
         raise SystemExit(f"unknown task {name!r}; choose from {sorted(TASKS)}")
-    global FINGER_SCHEDULE, DISTURBANCES
+    global FINGER_SCHEDULE, DISTURBANCES, GRASP_START, GRASP_END, RELEASE_WINDOW
     TASK = name
     LAYOUT = TASKS[name][1]
     MAX_LAG_ROT = TASK_LAG_ROT[name]
+    GRASP_START, GRASP_END = TASK_GRASP[name]
+    RELEASE_WINDOW = TASK_RELEASE[name]
     FINGER_SCHEDULE = None
     DISTURBANCES = []
     if name == "handoff":
@@ -661,8 +739,9 @@ def squeeze_depth(t: float, t_end: float) -> float:
     if t < GRASP_END:
         return approach_gap + (grip - approach_gap) * smoothstep(
             (t - GRASP_START) / (GRASP_END - GRASP_START))
-    if t > t_end - 0.9:
-        return grip + (approach_gap - grip) * smoothstep((t - (t_end - 0.9)) / 0.9)
+    if RELEASE_WINDOW > 0 and t > t_end - RELEASE_WINDOW:
+        return grip + (approach_gap - grip) * smoothstep(
+            (t - (t_end - RELEASE_WINDOW)) / RELEASE_WINDOW)
     return grip
 
 
@@ -706,6 +785,23 @@ class Sim:
         self.model = mujoco.MjModel.from_xml_string(build_xml())
         self.data = mujoco.MjData(self.model)
         self.ref, self.segments = TASKS[TASK][0]()
+
+        # Auto-size the rotational lag clamp from the trajectory. A clamp smaller than
+        # the largest single rotation the reference asks for will saturate, and a
+        # saturated clamp deadlocks: the fingers stall, relative slip goes to zero, so
+        # friction goes to zero, so the object never starts turning and the clamp never
+        # releases. This failure has appeared three times in this project (the 90 degree
+        # flip, the 54.7 degree corner rotation, the 50 degree probe) and it is not
+        # obvious from the symptom, so it is now impossible to reintroduce by hand.
+        need = 0.0
+        for i in range(len(self.ref.t) - 1):
+            r0 = self.ref.slerp(self.ref.t[i])
+            r1 = self.ref.slerp(self.ref.t[i + 1])
+            need = max(need, float(np.linalg.norm((r1 * r0.inv()).as_rotvec())))
+        self.max_lag_rot = max(MAX_LAG_ROT, 1.25 * need)
+        if self.max_lag_rot > MAX_LAG_ROT + 1e-9:
+            print(f"  [lag clamp raised {MAX_LAG_ROT:.2f} -> {self.max_lag_rot:.2f} rad; "
+                  f"trajectory needs {np.rad2deg(need):.1f} deg in one move]")
         self.cube_bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "cube")
         self.finger_bids = [
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"finger{i}")
@@ -820,8 +916,8 @@ class Sim:
                       -MAX_LAG, MAX_LAG)
         rv = e_r + KI_ROT * self._int_r - KD_ROT * (w - w_d)
         n = np.linalg.norm(rv)
-        if n > MAX_LAG_ROT:
-            rv = rv * (MAX_LAG_ROT / n)
+        if n > self.max_lag_rot:
+            rv = rv * (self.max_lag_rot / n)
         return p + lin, Rot.from_rotvec(rv) * R
 
     def allocate(self, t, R_c):

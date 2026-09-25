@@ -328,6 +328,85 @@ sets the height and no amount of pushing will raise it to the reference.
 surface, which is close enough for a toppling object to land on. Released fingers now
 blend back to their home poses.
 
+## Learning: CEM over contact placement
+
+`learn_placement.py`. Cross-entropy method over where the fingertips sit. Sample a
+population of placements, run each through the simulator, keep the best quarter, refit
+the sampling distribution, repeat. The simulator is the fitness function.
+
+```
+python learn_placement.py --fingers 4 --generations 12 --population 32
+python learn_placement.py --fingers 5 --min-fingers      # decrement while it still holds
+python learn_placement.py --replay best_placement_n4.json
+python swarm_sim.py --contacts best_placement_n4.json --out out/learned.mp4
+```
+
+**Why this and not the LP.** `min_fingers.py` answers "can these contacts produce the
+required wrench", which turned out to be badly insufficient: it declared three contacts
+enough for the corner balance and the simulator jammed the cube against the table. CEM
+optimises whether the controller actually holds the object. It is slower and proves
+nothing, but it cannot be confidently wrong the way the LP was.
+
+**Parameterisation.** Each contact is a free 3-vector, ray-cast from the cube centre onto
+the surface by `swarm_sim.surface_point`. So n contacts is 3n continuous parameters with
+no discrete face indices. The map covers edges and vertices, where the normal becomes the
+bisector of the adjoining faces. The LP's face-grid candidate set could not express a
+vertex contact, which is exactly the contact that matters for balancing on a corner. This
+one can reach it.
+
+**Result, 4 fingers on the probe task**, 8 generations of 16:
+
+| | cost | RMS pos | RMS rot |
+|---|---|---|---|
+| heuristic layout | 8.447 | 0.487 mm | 3.808° |
+| CEM best | **1.704** | 0.486 mm | **0.452°** |
+
+The entire gain is in orientation. Position tracking was already fine; the heuristic's
+four-finger layout simply had poor torque authority, and the search found lever arms that
+did not. Feasible fraction of the population went from 12/16 to 16/16 by generation 1.
+
+## Watching many at once
+
+`tiled_view.py`. MuJoCo has no tiled renderer like Isaac Lab's, and does not need one for
+this: put N copies of the scene into ONE model on a grid, and a single physics step
+advances all of them while a single render pass draws all of them. Copies are fully
+independent (separate bodies, separate contact islands) and each runs its own contact
+placement, because placement lives in the controller rather than the XML.
+
+```
+python tiled_view.py --grid 4 4 --from-cem best_placement_n4.json --out out/tiled.mp4
+python tiled_view.py --grid 3 3 --random 9 --fingers 4 --viewer     # interactive
+```
+
+16 tiles is nq=560, nv=480. On 2 cores with software rendering that runs at about 22x
+slower than real time; on a GPU box it is watchable. The honest limit: cost scales
+roughly linearly in tiles, so this tops out in the low tens, not hundreds. It is a
+visualisation tool. For throughput use independent processes (which `learn_placement.py`
+already does) or MJX; for hundreds of tiles rendered live, Isaac Lab is the right tool
+and this is not.
+
+## Three harness bugs the optimiser exposed
+
+All three made the fitness function silently meaningless rather than throwing, which is
+the failure mode to watch for when the simulator becomes an objective function.
+
+**The release schedule fired mid-episode.** `squeeze_depth` releases the grip in the
+final 0.9 s of any task. The probe episode is 4.9 s, so the release fired at t=4.0 in the
+middle of the rotation and every candidate was scored as having dropped the object,
+identically. The fitness function was blind and returned plausible-looking numbers.
+Release timing is now per task (`TASK_RELEASE`), zero for the probe.
+
+**The lag clamp saturated, for the third time.** The probe asks for a 50° rotation
+against a 34.4° clamp. Rather than fix it per task again, `Sim.__init__` now measures the
+largest single rotation in the reference and raises the clamp automatically, printing
+when it does. This bug had already appeared on the 90° flip and the 54.7° corner
+rotation and is not diagnosable from the symptom.
+
+**`Reference.__call__` overshot its own last keyframe.** It computed the slerp argument as
+`t0 + s*(t1-t0)`, which is not exactly `t1` in floating point, and scipy's `Slerp` raises
+on an argument one ulp past its last knot. Latent in every task, would fire at the final
+timestep. Now clamped.
+
 ## Four things that bit, and will bite again
 
 **MuJoCo mocap bodies cannot grip.** A mocap body has no degrees of freedom, so the
