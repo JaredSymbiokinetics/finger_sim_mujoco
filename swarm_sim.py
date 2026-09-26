@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -223,7 +224,11 @@ KI_ROT = 2.0               # 1/s, integral gain on orientation error
 # or the integrator can walk a finger clean off the object it is holding. At 3.0 * 0.0005
 # the most it can ever command is 1.5 mm against a 3.0 mm squeeze.
 IMAX_POS = 0.0005          # m, anti-windup clamp
-IMAX_ROT = 0.05            # rad, anti-windup clamp
+# IMAX_ROT was cut to 0.05 alongside IMAX_POS while fixing the handoff windup. Only the
+# POSITION integrator could walk a finger off the object; cutting the rotational one too
+# was collateral, and it cost the demo most of its orientation accuracy (1.21 -> 1.93 deg
+# RMS). Left at its tuned value.
+IMAX_ROT = 0.15            # rad, anti-windup clamp
 SLEW = 1.60                # m/s, rate limit on fingertip setpoint motion
 
 BASE_COLORS = [
@@ -348,7 +353,13 @@ def smoothstep(u: float) -> float:
 class Reference:
     """Keyframed SE(3) reference with smoothstep position blending and slerp rotation."""
 
-    def __init__(self, keys):
+    def __init__(self, keys, ease=True):
+        # ease=True applies smoothstep between keyframes, which forces ZERO VELOCITY at
+        # every key. That is exactly right for hand-authored hold/move keyframes and
+        # exactly wrong for a densely sampled recording, where it turns a smooth drag
+        # into one stop-start per key. Recorded paths are already smoothed, so they
+        # interpolate linearly instead.
+        self.ease = ease
         self.t = np.array([k[0] for k in keys], dtype=float)
         self.p = np.array([k[1] for k in keys], dtype=float)
         rots = Rot.from_quat([k[2] for k in keys])   # scipy uses xyzw
@@ -359,7 +370,8 @@ class Reference:
         t = min(max(t, self.t[0]), self.t[-1])
         i = int(np.clip(np.searchsorted(self.t, t) - 1, 0, len(self.t) - 2))
         t0, t1 = self.t[i], self.t[i + 1]
-        s = smoothstep((t - t0) / (t1 - t0)) if t1 > t0 else 0.0
+        u = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+        s = smoothstep(u) if self.ease else min(max(u, 0.0), 1.0)
         pos = self.p[i] + s * (self.p[i + 1] - self.p[i])
         # Re-time the slerp through the same smoothstep so translation and rotation
         # stay synchronised and both start and stop with zero rate. Clamp the result:
@@ -636,6 +648,28 @@ def build_probe_reference():
     return Reference(k), seg
 
 
+def load_trajectory(path, lead_in=None):
+    """A reference recorded by record_trajectory.py, in place of a coded one.
+
+    A recording starts moving at t=0, but the swarm needs time to fly in and close
+    before anything can be carried. So a hold at the initial pose is prepended, long
+    enough to cover the grasp, and everything is shifted after it. Without this the
+    object is commanded to move while the fingers are still in mid-air, the error runs
+    away immediately, and the replay looks like a controller failure when it is really
+    a missing lead-in.
+    """
+    spec = json.load(open(path))
+    keys = [(float(k["t"]), list(k["pos"]), list(k["quat"])) for k in spec["keys"]]
+    lead = (GRASP_END + 0.4) if lead_in is None else lead_in
+    t0 = keys[0][0]
+    shifted = [(0.0, keys[0][1], keys[0][2]),
+               (lead, keys[0][1], keys[0][2])]
+    shifted += [(lead + (t - t0), p, q) for t, p, q in keys[1:]]
+    segs = [(0.0, lead, "approach + grasp"),
+            (lead, shifted[-1][0], f"recorded: {os.path.basename(path)}")]
+    return Reference(shifted, ease=False), segs
+
+
 TASKS = {
     "demo": (build_reference, "equator"),
     "corner": (build_corner_reference, "corner"),
@@ -651,7 +685,7 @@ LAYOUT = "equator"
 # friction, so the object never starts turning and the clamp never releases. The corner
 # task rotates 54.7 degrees onto the body diagonal, which the demo's 28.6 degree clamp
 # cannot accommodate.
-TASK_LAG_ROT = {"demo": 0.50, "corner": 1.20, "handoff": 1.20, "probe": 0.60}
+TASK_LAG_ROT = {"demo": 0.50, "corner": 1.20, "handoff": 1.20, "probe": 1.00}
 
 # Grasp timings per task. The probe is deliberately short: it exists to score a contact
 # placement inside an optimiser loop, where rollout cost is the binding constraint.
@@ -779,6 +813,75 @@ def finger_quat(normal_world: np.ndarray) -> np.ndarray:
 # Simulation
 # --------------------------------------------------------------------------------------
 
+
+# --------------------------------------------------------------------------------------
+# The control law, as free functions.
+#
+# These exist so that every environment in the project runs the SAME controller. The
+# tiled viewer originally carried its own transcription of this logic and had already
+# drifted from it (no auto-sized lag clamp, no table-contact integrator freeze). Two
+# copies of a controller that are supposed to be identical will diverge, and then a
+# result measured in one is not a result about the other.
+# --------------------------------------------------------------------------------------
+
+def required_lag_rot(ref):
+    """Largest single rotation the reference asks for, in radians."""
+    need = 0.0
+    for i in range(len(ref.t) - 1):
+        r0 = ref.slerp(ref.t[i])
+        r1 = ref.slerp(ref.t[i + 1])
+        need = max(need, float(np.linalg.norm((r1 * r0.inv()).as_rotvec())))
+    return need
+
+
+def solve_commanded_pose(p, R, p_d, R_d, v, w, v_d, w_d, int_p, int_r,
+                         max_lag_rot, integrate_pos=True):
+    """The object-level loop. Returns (p_cmd, R_cmd, int_p, int_r)."""
+    e_p = p_d - p
+    e_r = (R_d * R.inv()).as_rotvec()
+    if integrate_pos:
+        int_p = np.clip(int_p + e_p * TIMESTEP, -IMAX_POS, IMAX_POS)
+    int_r = np.clip(int_r + e_r * TIMESTEP, -IMAX_ROT, IMAX_ROT)
+    lin = np.clip(e_p + KI_POS * int_p - KD_POS * (v - v_d), -MAX_LAG, MAX_LAG)
+    rv = e_r + KI_ROT * int_r - KD_ROT * (w - w_d)
+    n = np.linalg.norm(rv)
+    if n > max_lag_rot:
+        rv = rv * (max_lag_rot / n)
+    return p + lin, Rot.from_rotvec(rv) * R, int_p, int_r
+
+
+def targets_from_pose(p_c, R_c, contacts, deltas):
+    """Map a commanded object pose to per-fingertip setpoints and orientations."""
+    targets, quats = [], []
+    for (offset, normal), d in zip(contacts, deltas):
+        n_w = R_c.apply(normal)
+        targets.append(p_c + R_c.apply(offset) + n_w * (TIP_RADIUS - d))
+        quats.append(finger_quat(n_w))
+    return np.array(targets), quats
+
+
+def solve_mount_wrench(target, quat_des, p_f, R_f, v_f, w_f):
+    """The per-finger virtual 6-DOF spring-damper. Returns (force, torque), world."""
+    R_d = Rot.from_quat([quat_des[1], quat_des[2], quat_des[3], quat_des[0]])
+    f = MOUNT_KP * (target - p_f) - MOUNT_KD * v_f
+    nf = np.linalg.norm(f)
+    if nf > MOUNT_FMAX:
+        f = f * (MOUNT_FMAX / nf)
+    tau = MOUNT_KR * (R_d * R_f.inv()).as_rotvec() - MOUNT_KW * w_f
+    nt = np.linalg.norm(tau)
+    if nt > MOUNT_TMAX:
+        tau = tau * (MOUNT_TMAX / nt)
+    return f, tau
+
+
+def slew_limit(targets, prev):
+    """Rate-limit setpoints so a jump cannot slam the mount to saturation."""
+    step = SLEW * TIMESTEP
+    d = np.asarray(targets) - prev
+    n = np.linalg.norm(d, axis=1, keepdims=True)
+    return prev + d * np.minimum(1.0, step / np.maximum(n, 1e-12))
+
+
 class Sim:
     def __init__(self, mode: str = "dynamic"):
         self.mode = mode
@@ -793,15 +896,20 @@ class Sim:
         # releases. This failure has appeared three times in this project (the 90 degree
         # flip, the 54.7 degree corner rotation, the 50 degree probe) and it is not
         # obvious from the symptom, so it is now impossible to reintroduce by hand.
-        need = 0.0
-        for i in range(len(self.ref.t) - 1):
-            r0 = self.ref.slerp(self.ref.t[i])
-            r1 = self.ref.slerp(self.ref.t[i + 1])
-            need = max(need, float(np.linalg.norm((r1 * r0.inv()).as_rotvec())))
-        self.max_lag_rot = max(MAX_LAG_ROT, 1.25 * need)
-        if self.max_lag_rot > MAX_LAG_ROT + 1e-9:
-            print(f"  [lag clamp raised {MAX_LAG_ROT:.2f} -> {self.max_lag_rot:.2f} rad; "
-                  f"trajectory needs {np.rad2deg(need):.1f} deg in one move]")
+        # WARN, do not auto-raise. Auto-sizing this from the trajectory's largest
+        # rotation was the wrong fix: a 90 degree rotation spread over 2.8 s never needs
+        # a 90 degree clamp, because a healthy run tracks continuously and the
+        # instantaneous error stays small. Only a STALLED run needs the headroom. Raising
+        # it anyway cost the demo a third of its accuracy (0.40 -> 0.59 mm RMS), because
+        # the tighter clamp was doing useful damping. Per-task values stay explicit; this
+        # just refuses to let the failure mode be silent.
+        self.max_lag_rot = MAX_LAG_ROT
+        need = required_lag_rot(self.ref)
+        if need > MAX_LAG_ROT and TASK != "handoff":
+            print(f"  [warning: task '{TASK}' rotates {np.rad2deg(need):.1f} deg in one "
+                  f"move but MAX_LAG_ROT is {np.rad2deg(MAX_LAG_ROT):.1f} deg. If the "
+                  f"object never starts turning, that is why: a saturated clamp stalls "
+                  f"the fingers, which kills friction, which stalls the object.]")
         self.cube_bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "cube")
         self.finger_bids = [
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"finger{i}")
@@ -900,25 +1008,16 @@ class Sim:
         if self.mode != "dynamic" or t <= GRASP_START:
             return p, R
 
-        e_p, e_r = self.pose_error(t)
         v, w = self.object_twist()
         v_d, w_d = self.ref_twist(t)
 
-        # Conditional integration. When the object is resting on the table, the table is
-        # what sets its height, and no amount of pushing will raise it to the reference.
-        # Integrating against that is a standing wind-up source: it walks the fingers
-        # upward until they let go of the object entirely.
-        if not self.touching_table():
-            self._int_p = np.clip(self._int_p + e_p * TIMESTEP, -IMAX_POS, IMAX_POS)
-        self._int_r = np.clip(self._int_r + e_r * TIMESTEP, -IMAX_ROT, IMAX_ROT)
-
-        lin = np.clip(e_p + KI_POS * self._int_p - KD_POS * (v - v_d),
-                      -MAX_LAG, MAX_LAG)
-        rv = e_r + KI_ROT * self._int_r - KD_ROT * (w - w_d)
-        n = np.linalg.norm(rv)
-        if n > self.max_lag_rot:
-            rv = rv * (self.max_lag_rot / n)
-        return p + lin, Rot.from_rotvec(rv) * R
+        # Conditional integration: when the table is carrying the object it sets the
+        # height, and integrating against that walks the fingers off the object.
+        p_c, R_c, self._int_p, self._int_r = solve_commanded_pose(
+            p, R, *self.ref(min(t, self.ref.duration)), v, w, v_d, w_d,
+            self._int_p, self._int_r, self.max_lag_rot,
+            integrate_pos=not self.touching_table())
+        return p_c, R_c
 
     def allocate(self, t, R_c):
         """Contact forces (on the object, world frame) realising the commanded wrench.
@@ -1043,19 +1142,7 @@ class Sim:
         for i in range(N_FINGERS):
             p, R = self.finger_pose(i)
             v, w = self.finger_twist(i)
-            wxyz = quats[i]
-            R_d = Rot.from_quat([wxyz[1], wxyz[2], wxyz[3], wxyz[0]])
-
-            f = MOUNT_KP * (targets[i] - p) - MOUNT_KD * v
-            nf = np.linalg.norm(f)
-            if nf > MOUNT_FMAX:
-                f *= MOUNT_FMAX / nf
-
-            tau = MOUNT_KR * (R_d * R.inv()).as_rotvec() - MOUNT_KW * w
-            nt = np.linalg.norm(tau)
-            if nt > MOUNT_TMAX:
-                tau *= MOUNT_TMAX / nt
-
+            f, tau = solve_mount_wrench(targets[i], quats[i], p, R, v, w)
             self.data.xfrc_applied[self.finger_bids[i], :3] = f
             self.data.xfrc_applied[self.finger_bids[i], 3:] = tau
 
@@ -1524,6 +1611,8 @@ def main():
     ap.add_argument("--control", choices=["position", "hybrid"], default="position",
                     help="hybrid adds friction-cone force allocation; needed for "
                          "minimal contact sets")
+    ap.add_argument("--trajectory", default=None,
+                    help="JSON from record_trajectory.py; replaces the task reference")
     ap.add_argument("--contacts", default=None,
                     help="JSON contact set from min_fingers.py; overrides --fingers")
     ap.add_argument("--out", default="out/swarm_demo.mp4")
@@ -1542,6 +1631,10 @@ def main():
         globals()["HANDOFF_PLACERS"] = args.fingers
     set_task(args.task)
     globals()["CONTROL"] = args.control
+    if args.trajectory:
+        TASKS[args.task] = (lambda p=args.trajectory: load_trajectory(p),
+                            TASKS[args.task][1])
+        print(f"reference from {args.trajectory}")
 
     if args.sweep:
         sys.exit(0 if sweep() else 1)

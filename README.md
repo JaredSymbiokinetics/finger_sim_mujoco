@@ -407,6 +407,144 @@ rotation and is not diagnosable from the symptom.
 on an argument one ulp past its last knot. Latent in every task, would fire at the final
 timestep. Now clamped.
 
+## Files
+
+| file | what it is |
+|---|---|
+| `swarm_sim.py` | physics, the controller, the built-in tasks, single-env rendering |
+| `objects.py` | the manipulable objects and their surface maps |
+| `learn_placement.py` | CEM placement search, parallel across processes, headless |
+| `tiled_view.py` | a grid of environments running a live rolling search |
+| `record_trajectory.py` | author a trajectory by dragging the object with the mouse |
+| `min_fingers.py` | the LP minimiser. Sound for free-space grasps, wrong for balances |
+
+## Which controller runs where
+
+All of them run the SAME controller, through shared free functions in `swarm_sim`:
+`solve_commanded_pose`, `targets_from_pose`, `solve_mount_wrench`, `slew_limit`.
+
+This was not true before. `tiled_view.py` carried its own transcription of the control
+law and had already drifted from it: no auto-sized lag clamp, no table-contact
+integrator freeze. Two copies of a controller that are supposed to be identical will
+diverge, and then a result measured in one is not a result about the other. That matters
+a lot more once the simulator is an objective function.
+
+## Rolling search in the grid
+
+Each tile runs its own episode on its own clock. When a tile finishes or drops the
+object it is scored, reset on the spot, and handed the next candidate from an
+asynchronous CEM. The grid therefore keeps working indefinitely and you watch the
+population improve, instead of watching one fixed batch play out once. Table colour
+shows the last outcome: green held, red dropped.
+
+```
+python tiled_view.py --grid 4 4 --seconds 60 --out out/search.mp4
+python tiled_view.py --grid 3 3 --viewer                      # interactive
+python tiled_view.py --grid 4 4 --object cylinder --fingers 5
+python tiled_view.py --grid 4 4 --trajectory my_traj.json --seconds 60
+```
+
+The search is asynchronous on purpose. Tiles finish at different times (one that drops
+the object early frees up sooner than one that completes), so lockstep generations would
+leave most of the grid idle. Results go into a rolling buffer and the distribution
+refits whenever `population` of them have arrived.
+
+### How many tiles, honestly
+
+Measured on 2 cores, physics only, per 1 ms step:
+
+| tiles | ms/step | speed vs real time |
+|---|---|---|
+| 4 | 8.96 | 0.11x |
+| 9 | 18.69 | 0.05x |
+| 16 | 33.00 | 0.03x |
+| 25 | 50.58 | 0.02x |
+
+Cost is linear in tiles, about 2 ms per tile per step, and **it does not get better with
+more cores**: `mj_step` on one model is essentially single-threaded, so the whole grid is
+one serial solve. A faster machine buys single-core speed, maybe 2 to 3x, not 10x.
+
+What that means in practice: the interactive viewer is comfortable at 4 to 9 tiles,
+offline rendering is fine at 16 to 36, and hundreds live is not happening this way. That
+is a stronger argument for Isaac Lab than the rendering one I made earlier — Isaac and
+MJX parallelise the physics across environments on the GPU, where MuJoCo's single model
+does not. Use `learn_placement.py` (independent processes, genuinely parallel) when you
+want search throughput rather than a picture.
+
+## Swapping the object
+
+`objects.py`. Built in: `cube`, `box`, `sphere`, `cylinder`, `capsule`, `ellipsoid`, and
+`mesh` for your own CAD.
+
+```
+python tiled_view.py --grid 4 4 --object ellipsoid
+python tiled_view.py --grid 4 4 --object mesh --mesh part.stl --mesh-scale 0.001
+```
+
+Adding a shape means supplying three things: the MJCF body, a `surface_point(direction)`
+that ray-casts from the centre and returns `(offset, outward normal)`, and the rest
+height. The surface map is the interesting one, because it is what the optimiser
+searches over, so it has to be continuous and cover edges and vertices as well as faces.
+All the built-ins return the true outward normal, which at an edge or vertex is the
+bisector of the adjoining faces.
+
+Mesh caveats, in order of how likely they are to bite:
+
+- **Collision is the convex hull.** That is MuJoCo's default and it is what
+  `surface_point` probes, so the optimiser and the physics agree with each other, but
+  both may disagree with your actual part. For a meaningfully concave part, split it
+  into convex pieces, or keep primitives for collision and use the mesh for visual only.
+- **Units.** STL is unitless and MuJoCo is metres, so CAD in mm needs
+  `--mesh-scale 0.001`.
+- **Inertia** is computed from the mesh assuming uniform density. For a finger with a
+  camera in it that is wrong; override `<inertial>`.
+- The mesh normal is estimated from nearby ray hits, because `mj_ray` returns a distance
+  and a geom id but no normal.
+
+## Authoring a trajectory by dragging it
+
+`record_trajectory.py`. Three phases.
+
+```
+python record_trajectory.py --record --out my_traj.json
+python record_trajectory.py --check my_traj.json
+python swarm_sim.py --trajectory my_traj.json --out out/replay.mp4
+python tiled_view.py --grid 4 4 --trajectory my_traj.json --seconds 60
+```
+
+**Record.** The object loads alone, as a mocap body, with no fingers and no gravity.
+Mocap because a mocap body is kinematically positioned, so dragging is not a negotiation
+with the dynamics: it goes where you put it. Ctrl and left-drag translates, ctrl and
+right-drag rotates. Close the window when done.
+
+**Fit.** The path is resampled, smoothed, and reduced to keyframes.
+
+**Check.** This is the part worth not skipping. A dragged path is not dynamically
+feasible in general: you can pull the object through the table, or move it at 5 m/s, or
+demand a rotation no friction could deliver. Replay an infeasible demonstration and the
+swarm fails, and you cannot tell whether the controller is bad or the demonstration was
+impossible. The checker reports peak speed, acceleration, angular rate, required contact
+force and minimum height, and names the problems it finds.
+
+Two things this needed that are worth knowing:
+
+- **A lead-in hold.** A recording starts moving at t=0, but the swarm needs time to fly
+  in and close. Without a prepended hold the object is commanded to move while the
+  fingers are mid-air, error runs away immediately, and it looks like a controller
+  failure. `load_trajectory` prepends one covering the grasp.
+- **Linear interpolation, not smoothstep.** `Reference` eases between keyframes, which
+  forces zero velocity at every key. That is right for hand-authored hold/move keyframes
+  and wrong for a densely sampled recording, where it becomes one stop-start per key.
+  Recorded paths are already smoothed and interpolate linearly (`Reference(..., ease=False)`).
+
+With both fixes a recorded lift-and-twist replays at 0.30 mm and 0.32 deg RMS. Without
+them it was 72 mm.
+
+**Not tested interactively.** The sandbox this was written in has no display, so the
+record loop itself has never been driven by a real mouse. The fit, feasibility and
+replay stages are tested against a synthetic recording. Expect to shake something out of
+the viewer loop on first run.
+
 ## Four things that bit, and will bite again
 
 **MuJoCo mocap bodies cannot grip.** A mocap body has no degrees of freedom, so the
